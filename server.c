@@ -18,6 +18,8 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <sys/queue.h>
+
 
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
@@ -33,6 +35,14 @@ const char *SERVER_IP = "192.168.1.1";
 
 const long long FILE_BUFFER_SIZE = 60 * 1024 * 1024;
 
+struct mmaped_data {
+    char *data;
+	int length;
+    long int start_buf_index;     
+    TAILQ_ENTRY(mmaped_data) entries;    
+};
+
+TAILQ_HEAD(, mmaped_data) tailq_head;
 
 struct virt_header {
 	uint8_t fields[VIRT_HDR_MAX];
@@ -149,6 +159,10 @@ struct glob_meta_info {
 	struct mac_range src_mac;
     int virt_header;
     struct nmport_d *nmd;
+    char *file_name;
+    int fileDesc;
+    long int fileSize;
+    long int readBytes;
 
 };
 
@@ -220,37 +234,73 @@ static struct pkt* create_and_get_req_pkt(struct glob_meta_info *gmi){
 
 const int STEPSIZE = 100;
 
-static char **loadFileFromMmap(char *fileName){
+static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
 
-    struct netmap_if *nifp;
-	struct netmap_ring *txring = NULL;
-    int fileDesc = open(fileName, O_RDONLY);
+    int fileDesc = gmi->fileDesc;
+    long int bytesToRead;
+   // printf("gmi->fileSize : %lu\n", gmi->fileSize);
+   // printf("gmi->readBytes : %lu\n", gmi->readBytes);
 
+    if (gmi->fileSize == gmi->readBytes) {
+        //printf("Done mmaping the file \n");
+        return 0;
+    } else {
+        bytesToRead = FILE_BUFFER_SIZE;
+        if (gmi->fileSize - gmi->readBytes < FILE_BUFFER_SIZE){
+            bytesToRead = gmi->fileSize - gmi->readBytes;
+        }
+
+        struct mmaped_data *mmapedData;
+
+        mmapedData = malloc(sizeof(*mmapedData));
+        if (mmapedData == NULL) {
+            perror("malloc failed");
+            exit(EXIT_FAILURE);
+        }
+
+        mmapedData->data = mmap(NULL, bytesToRead, MAP_PRIVATE | MAP_POPULATE, MAP_PRIVATE, fileDesc, gmi->readBytes);
+        if (mmapedData->data == MAP_FAILED) {
+            perror("mmap");
+            printf("Failed to map data \n");
+            exit(1);
+        }
+        mmapedData->length = bytesToRead;
+        mmapedData->start_buf_index = gmi->readBytes;
+        TAILQ_INSERT_TAIL(&tailq_head, mmapedData, entries);
+        gmi->readBytes += bytesToRead; 
+        return 1;
+    }   
+}
+
+ static void read_and_send()
+{
+
+    //char filePath[] = "/home/damith/workspace/files/client.c";
+    //char filePath[] = "/home/damith/workspace/files/file1.txt";
+    //char filePath[] = "/home/damith/workspace/files/file2.txt";
+    //char filePath[] = "/home/damith/workspace/files/cpyFile9-400mb";
+    char filePath[] = "/home/damith/workspace/files/cpyFile11-200mb";
+
+    struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
+    struct pkt* filePacket = create_and_get_req_pkt(gmi);
+    gmi->file_name = filePath;
+
+    int fileDesc = gmi->fileDesc = open(gmi->file_name, O_RDONLY);
     if (!fileDesc) {
         printf("Failed to read \n");
         exit(1);
     }
 
-    char **lines = (char **)malloc(STEPSIZE * sizeof(char *));
     struct stat sb;
-
     if(fstat(fileDesc, &sb) == -1) {
         printf("Failed to get file size \n");
         exit(1);
     }
+    gmi->fileSize = sb.st_size;
     printf("File size is %ld\n", sb.st_size);
 
-    long int i, bytesToRead;
-    char *mapData;
-    long int fileSize = sb.st_size;
-
-    int chunksRead = 0 ;
-
-    struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
-    struct pkt* filePacket = create_and_get_req_pkt(gmi);
-
-    int pkt_payload_size = gmi->pkt_payload_size;
-    //frame = (char*)filePacket + sizeof(filePacket->vh);
+    struct netmap_if *nifp;
+	struct netmap_ring *txring = NULL;
 
     gmi->nmd = nmport_prepare("netmap:enp0s25");
 
@@ -270,219 +320,143 @@ static char **loadFileFromMmap(char *fileName){
 	D("Wait %d secs for phy reset", 2);
 	sleep(2);
 	D("Ready to send data through netmap");
-
-    struct pollfd pfd = { .fd = gmi->nmd->fd, .events = POLLOUT, .revents = 100 };
-    nifp = gmi->nmd->nifp;
-    int sequenceNum = 1;
-   // int rv;
+    
     double start_time = now();
     double elapsed_time;
+    TAILQ_INIT(&tailq_head);
+    int sequenceNum = 1;
+    nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
-    int wakeUpLimit = 200;
+    while(mmapAndLoadQueue(gmi)) {
 
-    for (i = 0; i < fileSize; i += FILE_BUFFER_SIZE) {
+        struct mmaped_data *mmapedData;
+        long int bytesToRead = 0;
+        TAILQ_FOREACH(mmapedData, &tailq_head, entries) {
 
-        bytesToRead = FILE_BUFFER_SIZE;
-        if (fileSize - i < FILE_BUFFER_SIZE){
-            bytesToRead = fileSize - i;
-        }
-        processedFileSize += bytesToRead;
-
-        //printf("Bytes to read %ld\n", bytesToRead);
-        //printf("I value is %ld\n", i);
-       // double mapStart = now();
-       // printf("mmap started  \n");
-        //MAP_PRIVATE | MAP_POPULATE
-        //mapData = mmap(NULL, bytesToRead, PROT_READ, MAP_PRIVATE  , fileDesc, chunksRead * FILE_BUFFER_SIZE);
-        mapData = mmap(NULL, bytesToRead, PROT_READ, MAP_PRIVATE  , fileDesc, chunksRead * FILE_BUFFER_SIZE);
-       // printf("mmap end elapsed time : %f \n", now() - mapStart);
-
-        if (mapData == MAP_FAILED) {
-            perror("mmap");
-            printf("Failed to map data \n");
-            exit(1);
-        }
-
-        // if (chunksRead * FILE_BUFFER_SIZE > 1000000) {
-
-        // }
-
-        long int allowedPktReadBytes;
-        uint64_t numOfPacketsToSend = bytesToRead / pkt_payload_size; //todo check modules and + 1
-        if(bytesToRead % pkt_payload_size != 0) {
-            numOfPacketsToSend++;
-        }
-	    uint64_t sent = 0;
-        printf("numOfPacketsToSend %ld\n", numOfPacketsToSend);
-
-        
-        txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
-        u_int n, head = txring->head;
-        struct netmap_slot *slot = &txring->slot[head];
-        n = nm_ring_space(txring);
-        //printf("b4 n value : %d \n", n);
-
-        
-        for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo 
-
-            u_int tosend = gmi->pkt_size;
-            allowedPktReadBytes = pkt_payload_size;
-            if (bytesToRead - w < pkt_payload_size) {
-                allowedPktReadBytes = bytesToRead - w;
-               
-            }
-            filePacket->ipv4.pktMeta.sequence_num = sequenceNum;
-            //printf("allowedPktReadBytes %lu \n", allowedPktReadBytes);
-            slot = &txring->slot[head];
-            char *p = NETMAP_BUF(txring, slot->buf_idx);
-            slot->flags = 0;
-            struct pkt* sendPkt = (struct pkt*)p;
-            //sendPkt->vh = filePacket->vh;
-            sendPkt->eh = filePacket->eh;
-            sendPkt->ipv4.ip = filePacket->ipv4.ip;
-            sendPkt->ipv4.pktMeta = filePacket->ipv4.pktMeta;
-            sendPkt->ipv4.udp = filePacket->ipv4.udp;
-
-            if (i == 0 && w == 0) {
-                sendPkt->ipv4.pktMeta.status = 1;
-                printf("Startingggggggg \n");
-            } else {
-                sendPkt->ipv4.pktMeta.status = 2;
-            }
-
-            if (sent == numOfPacketsToSend - 1 && processedFileSize == fileSize ) {
-                printf("Enddddddddddd \n");
-                sendPkt->ipv4.pktMeta.status = 3;
-            }
+            long int allowedPktReadBytes;
+            bytesToRead = mmapedData->length;
+            int pkt_payload_size = gmi->pkt_payload_size;
+            uint64_t numOfPacketsToSend = bytesToRead / pkt_payload_size;
+            processedFileSize += bytesToRead;
             
-
-            // off_t refVal = w;
-            //char *payloadString;
-            // for(int j = 0; j< allowedPktReadBytes; j++) {
-            //     payloadSting[j] = &mapData[refVal];
-            //     refVal++;
-            // }
-
-            //assignPayload(&payloadString, allowedPktReadBytes, &mapData[w]);
-            //free(payloadString);
-            //(void)allowedPktReadBytes;
-            //nm_pkt_copy(&mapData[w], sendPkt->ipv4.body, allowedPktReadBytes);
-            //nm_pkt_copy(payloadSting, &mapData[w], allowedPktReadBytes);
-            //memset(sendPkt->ipv4.body, 0x00, sizeof(sendPkt->ipv4.body));
-            //printf("############# beforeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee part : %s \n", sendPkt->ipv4.body);
-            //printf("\n");
-           // printf("\n");
-            //memcpy(sendPkt->ipv4.body, &mapData[w], allowedPktReadBytes);
-            //printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ part : %s \n", sendPkt->ipv4.body);
-           // printf("\n");
-            slot->len = tosend;
-            //memmove(sendPkt->ipv4.body,&mapData[w], allowedPktReadBytes);
-            sendPkt->ipv4.pktMeta.size = allowedPktReadBytes;
-            memcpy(filePacket->ipv4.body, &mapData[w], allowedPktReadBytes);
-            //nm_pkt_copy(frame, p, gmi->pkt_size);
-            //printf("value of head is %d\n", head);
-            head = nm_ring_next(txring, head);
-            //slot->flags |= NS_REPORT;
-	        txring->cur = head;
-            if (sent == numOfPacketsToSend - 1) {
-                if (txring != NULL) {
-                    //printf("################################################# flushing the ring \n");
-                    ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
-                }
-               
-                //printf("Now n 566 value : %d \n", nm_ring_space(txring));
-                slot->flags |= NS_REPORT;
-		        txring->head = txring->cur = head;
-                n = nm_ring_space(txring);
-               // printf("Now n 570 value : %d \n", n);
-                txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
-                head = txring->head;
-
+            if(bytesToRead % pkt_payload_size != 0) {
+                numOfPacketsToSend++;
             }
-            n--;
-            sent++;
-            sequenceNum++;
+	        uint64_t sent = 0;
+            printf("numOfPacketsToSend %ld\n", numOfPacketsToSend);
 
-            if ((sent < numOfPacketsToSend && n == 0)) {
-                (void)wakeUpLimit;
-                slot->flags |= NS_REPORT;
-		        txring->head = head;
-                txring->cur = head;
+        
+            txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
+            u_int n, head = txring->head;
+            struct netmap_slot *slot = &txring->slot[head];
+            n = nm_ring_space(txring);
+
+            for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo 
+
+                u_int tosend = gmi->pkt_size;
+                allowedPktReadBytes = pkt_payload_size;
+                if (bytesToRead - w < pkt_payload_size) {
+                    allowedPktReadBytes = bytesToRead - w;
                 
-
-                if (sent < numOfPacketsToSend - 1) {
-                    if (n == 0) {
-                        // printf("ITS ZERO \n");
-                        if (n < 1) {
-                            txring->cur = txring->tail;
-                        }
-                    
-                        do {
-                            //printf("Doing again \n");
-                            n = nm_ring_space(txring);
-                            if (txring != NULL) {
-                                ioctl(pfd.fd, NIOCTXSYNC, NULL);
-                                //usleep(180);
-                            }
-                            //printf("Now n value : %d \n", n);
-                            //printf("Still n value is : %d \n", nm_ring_space(txring));
-                            
-                            
-                        } while (n == 0);
-                    } 
-                    
                 }
-               
-                //printf("Now n value 623 : %d \n", n);
-                txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
-                head = txring->head;
-            }   
+                filePacket->ipv4.pktMeta.sequence_num = sequenceNum;
+                //printf("allowedPktReadBytes %lu \n", allowedPktReadBytes);
+                slot = &txring->slot[head];
+                char *p = NETMAP_BUF(txring, slot->buf_idx);
+                slot->flags = 0;
+                struct pkt* sendPkt = (struct pkt*)p;
+                //sendPkt->vh = filePacket->vh;
+                sendPkt->eh = filePacket->eh;
+                sendPkt->ipv4.ip = filePacket->ipv4.ip;
+                sendPkt->ipv4.pktMeta = filePacket->ipv4.pktMeta;
+                sendPkt->ipv4.udp = filePacket->ipv4.udp;
+
+                if (sequenceNum == 1 && w == 0) {
+                    sendPkt->ipv4.pktMeta.status = 1;
+                    printf("Startingggggggg \n");
+                } else {
+                    sendPkt->ipv4.pktMeta.status = 2;
+                }
+
+                if (sent == numOfPacketsToSend - 1 && processedFileSize == gmi->fileSize ) {
+                    printf("Enddddddddddd \n");
+                    sendPkt->ipv4.pktMeta.status = 3;
+                }
+                
+                slot->len = tosend;
+                
+                sendPkt->ipv4.pktMeta.size = allowedPktReadBytes;
+                memcpy(filePacket->ipv4.body, &mmapedData->data[w], allowedPktReadBytes);
+                head = nm_ring_next(txring, head);
+                txring->cur = head;
+                if (sent == numOfPacketsToSend - 1) {
+                    if (txring != NULL) {
+                        //printf("################################################# flushing the ring \n");
+                        ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
+                    }
+                
+                    //printf("Now n 566 value : %d \n", nm_ring_space(txring));
+                    slot->flags |= NS_REPORT;
+                    txring->head = txring->cur = head;
+                    n = nm_ring_space(txring);
+                    // printf("Now n 570 value : %d \n", n);
+                    txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
+                    head = txring->head;
+
+                }
+                n--;
+                sent++;
+                sequenceNum++;
+
+                if ((sent < numOfPacketsToSend && n == 0)) {
+                    slot->flags |= NS_REPORT;
+                    txring->head = head;
+                    txring->cur = head;
+                    
+
+                    if (sent < numOfPacketsToSend - 1) {
+                        if (n == 0) {
+                            // printf("ITS ZERO \n");
+                            if (n < 1) {
+                                txring->cur = txring->tail;
+                            }
+                        
+                            do {
+                                //printf("Doing again \n");
+                                n = nm_ring_space(txring);
+                                if (txring != NULL) {
+                                    ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
+                                    //usleep(180);
+                                }
+                                if (n < 100) {
+                                   // printf("Still less\n");
+                                    mmapAndLoadQueue(gmi);
+                                }
+                                //printf("Now n value : %d \n", n);
+                                //printf("Still n value is : %d \n", nm_ring_space(txring)      
+                            } while (n < 100);
+                        } 
+                        
+                    }
+                
+                    //printf("Now n value 623 : %d \n", n);
+                    txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
+                    head = txring->head;
+                }   
+            }
+            if (munmap(mmapedData->data, bytesToRead) == -1) {
+                printf("Failed to un-map the file \n");
+                exit(1);
+            }
+            TAILQ_REMOVE(&tailq_head, mmapedData, entries);
+            free(mmapedData);
         }
-
-        if (munmap(mapData, bytesToRead) == -1) {
-            printf("Failed to un-map the file \n");
-            exit(1);
-        }
-        chunksRead ++;
     }
-
-    while (nm_tx_pending(txring)) {
-        //printf("################################################# still pending \n");
-        ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
-        usleep(1); /* wait 1 tick */
-    }
-
 
     double end_time = now();
     elapsed_time = end_time - start_time;
     printf("It took %f seconds to read 25GB \n", elapsed_time);
     printf("last seq num is %d \n", sequenceNum);
-
-    nmport_close(gmi->nmd);
-    close(fileDesc);
-    free(gmi);
-    
-    return lines;
-}
-
-
-
- static void read_and_send()
-{
-
-    //char filePath[] = "/home/damith/workspace/files/client.c";
-    char filePath[] = "/home/damith/workspace/files/file1.txt";
-    //char filePath[] = "/home/damith/workspace/files/file2.txt";
-    //char filePath[] = "/home/damith/workspace/files/cpyFile9-400mb";
-    //char filePath[] = "/home/damith/workspace/files/cpyFile11-200mb";
-    //
-
-
-    //int length = 0;
-    //char **words = loadFile(filePath, &length);
-    //loadFileFromFgets(filePath, &length);
-    //loadFileFromFreads(filePath, &length);
-    loadFileFromMmap(filePath);
 }
 
 
@@ -492,11 +466,9 @@ int main()
     printf("\n");
     printf("Using server ip as %s", SERVER_IP);
     printf("\n");
-    //struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
-    //create_initial_req_pkt();
+
     read_and_send();
     printf("Afterrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr");
     printf("\n");
-    //send_req(gmi);
 }
 /* end of file */
