@@ -327,6 +327,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     int sequenceNum = 1;
     nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
+    int wakeupLimit = 100;
     while(mmapAndLoadQueue(gmi)) {
 
         struct mmaped_data *mmapedData;
@@ -428,13 +429,13 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                                     ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
                                     //usleep(180);
                                 }
-                                if (n < 100) {
+                                if (n < wakeupLimit) {
                                    // printf("Still less\n");
                                     mmapAndLoadQueue(gmi);
                                 }
                                 //printf("Now n value : %d \n", n);
                                 //printf("Still n value is : %d \n", nm_ring_space(txring)      
-                            } while (n < 100);
+                            } while (n < wakeupLimit);
                         } 
                         
                     }
