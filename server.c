@@ -327,13 +327,11 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     int sequenceNum = 1;
     nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
-    int wakeupLimit = 100;
+    u_int wakeupLimit = 100;
     while(mmapAndLoadQueue(gmi)) {
-
         struct mmaped_data *mmapedData;
         long int bytesToRead = 0;
         TAILQ_FOREACH(mmapedData, &tailq_head, entries) {
-
             long int allowedPktReadBytes;
             bytesToRead = mmapedData->length;
             int pkt_payload_size = gmi->pkt_payload_size;
@@ -437,8 +435,8 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                                 //printf("Still n value is : %d \n", nm_ring_space(txring)      
                             } while (n < wakeupLimit);
                         } 
-                        
                     }
+                    //printf("Now n value : %d \n", n);
                 
                     //printf("Now n value 623 : %d \n", n);
                     txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
@@ -452,6 +450,11 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
             TAILQ_REMOVE(&tailq_head, mmapedData, entries);
             free(mmapedData);
         }
+    }
+    while (nm_tx_pending(txring)) {
+        //printf("################################################# still pending \n");
+        ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
+        usleep(1); /* wait 1 tick */
     }
 
     double end_time = now();
