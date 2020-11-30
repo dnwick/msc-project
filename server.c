@@ -42,7 +42,14 @@ struct mmaped_data {
     TAILQ_ENTRY(mmaped_data) entries;    
 };
 
-TAILQ_HEAD(, mmaped_data) tailq_head;
+struct file_chunk_data {
+    char *data;
+	int length;     
+    TAILQ_ENTRY(file_chunk_data) entries;    
+};
+
+TAILQ_HEAD(, mmaped_data) tailq_head_mmap;
+TAILQ_HEAD(, file_chunk_data) tailq_head_file_chunk;
 
 struct virt_header {
 	uint8_t fields[VIRT_HDR_MAX];
@@ -163,6 +170,9 @@ struct glob_meta_info {
     int fileDesc;
     long int fileSize;
     long int readBytes;
+    long int curMmappedSize;
+    off_t curFileChunkIndex;
+    char *curProcessingMmappedData;
 
 };
 
@@ -232,12 +242,35 @@ static struct pkt* create_and_get_req_pkt(struct glob_meta_info *gmi){
     return pktdata;
 }
 
-const int STEPSIZE = 100;
+static void loadFileChunkQueue(long int bytesToRead, struct glob_meta_info *gmi) {
+    long int allowedFileChunkReadBytes;
+
+    if (gmi->curFileChunkIndex < bytesToRead) {
+        printf("we can chunk data \n");
+        allowedFileChunkReadBytes = gmi->pkt_payload_size;
+        if (bytesToRead - gmi->curFileChunkIndex < gmi->pkt_payload_size) {
+            allowedFileChunkReadBytes = bytesToRead - gmi->curFileChunkIndex;
+        }
+        struct file_chunk_data *fileChunkData;
+        fileChunkData = malloc(sizeof(*fileChunkData));
+        if (fileChunkData == NULL) {
+            perror("malloc failed");
+            exit(EXIT_FAILURE);
+        }
+        printf("going to mem cpy with %lu \n", gmi->curFileChunkIndex);
+        memcpy(fileChunkData->data, &gmi->curProcessingMmappedData[gmi->curFileChunkIndex], allowedFileChunkReadBytes);
+        printf("after mem cpy \n");
+        fileChunkData->length = allowedFileChunkReadBytes;
+        TAILQ_INSERT_TAIL(&tailq_head_file_chunk, fileChunkData, entries);
+        gmi->curFileChunkIndex += allowedFileChunkReadBytes;   
+    } 
+}
 
 static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
 
     int fileDesc = gmi->fileDesc;
     long int bytesToRead;
+    long int mmapLimit = 120 * 1024 * 1024;
    // printf("gmi->fileSize : %lu\n", gmi->fileSize);
    // printf("gmi->readBytes : %lu\n", gmi->readBytes);
 
@@ -245,29 +278,30 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
         //printf("Done mmaping the file \n");
         return 0;
     } else {
-        bytesToRead = FILE_BUFFER_SIZE;
-        if (gmi->fileSize - gmi->readBytes < FILE_BUFFER_SIZE){
-            bytesToRead = gmi->fileSize - gmi->readBytes;
-        }
+        if (gmi->curMmappedSize < mmapLimit) {
+            bytesToRead = FILE_BUFFER_SIZE;
+            if (gmi->fileSize - gmi->readBytes < FILE_BUFFER_SIZE){
+                bytesToRead = gmi->fileSize - gmi->readBytes;
+            }
 
-        struct mmaped_data *mmapedData;
-
-        mmapedData = malloc(sizeof(*mmapedData));
-        if (mmapedData == NULL) {
-            perror("malloc failed");
-            exit(EXIT_FAILURE);
-        }
-
-        mmapedData->data = mmap(NULL, bytesToRead, MAP_PRIVATE | MAP_POPULATE, MAP_PRIVATE, fileDesc, gmi->readBytes);
-        if (mmapedData->data == MAP_FAILED) {
-            perror("mmap");
-            printf("Failed to map data \n");
-            exit(1);
-        }
-        mmapedData->length = bytesToRead;
-        mmapedData->start_buf_index = gmi->readBytes;
-        TAILQ_INSERT_TAIL(&tailq_head, mmapedData, entries);
-        gmi->readBytes += bytesToRead; 
+            struct mmaped_data *mmapedData;
+            mmapedData = malloc(sizeof(*mmapedData));
+            if (mmapedData == NULL) {
+                perror("malloc failed");
+                exit(EXIT_FAILURE);
+            }
+            mmapedData->data = mmap(NULL, bytesToRead, PROT_READ, MAP_PRIVATE, fileDesc, gmi->readBytes);
+            if (mmapedData->data == MAP_FAILED) {
+                perror("mmap");
+                printf("Failed to map data \n");
+                exit(1);
+            }
+            mmapedData->length = bytesToRead;
+            mmapedData->start_buf_index = gmi->readBytes;
+            TAILQ_INSERT_TAIL(&tailq_head_mmap, mmapedData, entries);
+            gmi->readBytes += bytesToRead; 
+            gmi->curMmappedSize += bytesToRead;
+        }   
         return 1;
     }   
 }
@@ -323,15 +357,22 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     
     double start_time = now();
     double elapsed_time;
-    TAILQ_INIT(&tailq_head);
+    TAILQ_INIT(&tailq_head_mmap);
+    TAILQ_INIT(&tailq_head_file_chunk);
     int sequenceNum = 1;
     nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
     u_int wakeupLimit = 100;
+    
     while(mmapAndLoadQueue(gmi)) {
         struct mmaped_data *mmapedData;
         long int bytesToRead = 0;
-        TAILQ_FOREACH(mmapedData, &tailq_head, entries) {
+
+       // struct mmaped_data *firstVal = TAILQ_FIRST(&tailq_head_mmap);
+       // (void)firstVal;
+
+        TAILQ_FOREACH(mmapedData, &tailq_head_mmap, entries) {
+
             long int allowedPktReadBytes;
             bytesToRead = mmapedData->length;
             int pkt_payload_size = gmi->pkt_payload_size;
@@ -343,12 +384,12 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
             }
 	        uint64_t sent = 0;
             printf("numOfPacketsToSend %ld\n", numOfPacketsToSend);
-
         
             txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
             u_int n, head = txring->head;
             struct netmap_slot *slot = &txring->slot[head];
             n = nm_ring_space(txring);
+            gmi->curProcessingMmappedData = mmapedData->data;
 
             for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo 
 
@@ -385,7 +426,16 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                 slot->len = tosend;
                 
                 sendPkt->ipv4.pktMeta.size = allowedPktReadBytes;
-                memcpy(filePacket->ipv4.body, &mmapedData->data[w], allowedPktReadBytes);
+                struct file_chunk_data *fileChunk = TAILQ_FIRST(&tailq_head_file_chunk);
+                if (w != 0 && NULL != fileChunk) {
+                    printf("From additional chinking \n");
+                    memcpy(filePacket->ipv4.body, fileChunk->data, fileChunk->length);
+                    TAILQ_REMOVE(&tailq_head_file_chunk, fileChunk, entries);
+                } else {
+                    memcpy(filePacket->ipv4.body, &mmapedData->data[w], allowedPktReadBytes);
+                }
+
+                
                 head = nm_ring_next(txring, head);
                 txring->cur = head;
                 if (sent == numOfPacketsToSend - 1) {
@@ -415,11 +465,11 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
 
                     if (sent < numOfPacketsToSend - 1) {
                         if (n == 0) {
-                            // printf("ITS ZERO \n");
+                             //printf("ITS ZERO \n");
                             if (n < 1) {
                                 txring->cur = txring->tail;
                             }
-                        
+                            gmi->curFileChunkIndex = w + allowedPktReadBytes;
                             do {
                                 //printf("Doing again \n");
                                 n = nm_ring_space(txring);
@@ -428,8 +478,9 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                                     //usleep(180);
                                 }
                                 if (n < wakeupLimit) {
-                                   // printf("Still less\n");
+                                    printf("Still less\n");
                                     mmapAndLoadQueue(gmi);
+                                    loadFileChunkQueue(bytesToRead, gmi);
                                 }
                                 //printf("Now n value : %d \n", n);
                                 //printf("Still n value is : %d \n", nm_ring_space(txring)      
@@ -447,7 +498,8 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                 printf("Failed to un-map the file \n");
                 exit(1);
             }
-            TAILQ_REMOVE(&tailq_head, mmapedData, entries);
+            gmi->curMmappedSize -= bytesToRead;
+            TAILQ_REMOVE(&tailq_head_mmap, mmapedData, entries);
             free(mmapedData);
         }
     }
