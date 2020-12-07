@@ -43,13 +43,19 @@ struct mmaped_data {
 };
 
 struct file_chunk_data {
-    char *data;
+    uint8_t data[MAX_BODYSIZE];
 	int length;     
     TAILQ_ENTRY(file_chunk_data) entries;    
 };
 
+struct dropped_packet_data {
+	int sequenceNumber;     
+    TAILQ_ENTRY(dropped_packet_data) entries;    
+};
+
 TAILQ_HEAD(, mmaped_data) tailq_head_mmap;
 TAILQ_HEAD(, file_chunk_data) tailq_head_file_chunk;
+TAILQ_HEAD(, dropped_packet_data) tailq_dropped_packet_data;
 
 struct virt_header {
 	uint8_t fields[VIRT_HDR_MAX];
@@ -179,12 +185,13 @@ struct glob_meta_info {
 static struct pkt* create_and_get_req_pkt(struct glob_meta_info *gmi){
     gmi->pkt_size = 1500;
     gmi->pkt_payload_size = 1400;
-    gmi->src_ip.name = "192.168.1.103";
+    gmi->src_ip.name = "192.168.1.105";
     gmi->src_ip.port0 = 1234;
-	gmi->dst_ip.name = "192.168.1.105";
+	gmi->dst_ip.name = "192.168.1.103";
     gmi->dst_ip.port0 = 8000;
-    gmi->dst_mac.name = "b4:a9:fc:78:63:b1";
-    gmi->src_mac.name = "f0:de:f1:9a:16:ef";
+    gmi->dst_mac.name = "f0:de:f1:9a:16:ef";
+    gmi->src_mac.name = "b4:a9:fc:78:63:b1";
+    
     extract_mac_range(&gmi->src_mac);
     extract_mac_range(&gmi->dst_mac);
     uint16_t paylen;
@@ -246,7 +253,7 @@ static void loadFileChunkQueue(long int bytesToRead, struct glob_meta_info *gmi)
     long int allowedFileChunkReadBytes;
 
     if (gmi->curFileChunkIndex < bytesToRead) {
-        printf("we can chunk data \n");
+        //printf("we can chunk data \n");
         allowedFileChunkReadBytes = gmi->pkt_payload_size;
         if (bytesToRead - gmi->curFileChunkIndex < gmi->pkt_payload_size) {
             allowedFileChunkReadBytes = bytesToRead - gmi->curFileChunkIndex;
@@ -257,9 +264,10 @@ static void loadFileChunkQueue(long int bytesToRead, struct glob_meta_info *gmi)
             perror("malloc failed");
             exit(EXIT_FAILURE);
         }
-        printf("going to mem cpy with %lu \n", gmi->curFileChunkIndex);
+        //printf("going to mem cpy with %lu \n", gmi->curFileChunkIndex);
+        //printf("&gmi->curProcessingMmappedData[gmi->curFileChunkIndex] : %s", &gmi->curProcessingMmappedData[gmi->curFileChunkIndex]);
         memcpy(fileChunkData->data, &gmi->curProcessingMmappedData[gmi->curFileChunkIndex], allowedFileChunkReadBytes);
-        printf("after mem cpy \n");
+        //printf("after mem cpy \n");
         fileChunkData->length = allowedFileChunkReadBytes;
         TAILQ_INSERT_TAIL(&tailq_head_file_chunk, fileChunkData, entries);
         gmi->curFileChunkIndex += allowedFileChunkReadBytes;   
@@ -313,7 +321,10 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     //char filePath[] = "/home/damith/workspace/files/file1.txt";
     //char filePath[] = "/home/damith/workspace/files/file2.txt";
     //char filePath[] = "/home/damith/workspace/files/cpyFile9-400mb";
-    char filePath[] = "/home/damith/workspace/files/cpyFile11-200mb";
+    //char filePath[] = "/home/damith/finalProj/fileRepo/cpyFile11-200mb-out";
+    //char filePath[] = "/home/damith/finalProj/fileRepo/netmapClientPsudoCode";
+    char filePath[] = "/home/damith/finalProj/fileRepo/file1.txt-out";
+    
 
     struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
     struct pkt* filePacket = create_and_get_req_pkt(gmi);
@@ -336,7 +347,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     struct netmap_if *nifp;
 	struct netmap_ring *txring = NULL;
 
-    gmi->nmd = nmport_prepare("netmap:enp0s25");
+    gmi->nmd = nmport_prepare("netmap:enp1s0");
 
     if (gmi->nmd == NULL){
 		printf("something is wrong ...");
@@ -362,7 +373,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     int sequenceNum = 1;
     nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
-    u_int wakeupLimit = 100;
+    u_int wakeupLimit = 170;
     
     while(mmapAndLoadQueue(gmi)) {
         struct mmaped_data *mmapedData;
@@ -373,7 +384,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
 
         TAILQ_FOREACH(mmapedData, &tailq_head_mmap, entries) {
 
-            long int allowedPktReadBytes;
+            int allowedPktReadBytes;
             bytesToRead = mmapedData->length;
             int pkt_payload_size = gmi->pkt_payload_size;
             uint64_t numOfPacketsToSend = bytesToRead / pkt_payload_size;
@@ -390,6 +401,8 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
             struct netmap_slot *slot = &txring->slot[head];
             n = nm_ring_space(txring);
             gmi->curProcessingMmappedData = mmapedData->data;
+            long int actualMemCpyCount = 0;
+            long int fileChunkCpyCount = 0;
 
             for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo 
 
@@ -399,7 +412,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                     allowedPktReadBytes = bytesToRead - w;
                 
                 }
-                filePacket->ipv4.pktMeta.sequence_num = sequenceNum;
+                
                 //printf("allowedPktReadBytes %lu \n", allowedPktReadBytes);
                 slot = &txring->slot[head];
                 char *p = NETMAP_BUF(txring, slot->buf_idx);
@@ -410,6 +423,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                 sendPkt->ipv4.ip = filePacket->ipv4.ip;
                 sendPkt->ipv4.pktMeta = filePacket->ipv4.pktMeta;
                 sendPkt->ipv4.udp = filePacket->ipv4.udp;
+                sendPkt->ipv4.pktMeta.sequence_num = sequenceNum;
 
                 if (sequenceNum == 1 && w == 0) {
                     sendPkt->ipv4.pktMeta.status = 1;
@@ -427,14 +441,18 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                 
                 sendPkt->ipv4.pktMeta.size = allowedPktReadBytes;
                 struct file_chunk_data *fileChunk = TAILQ_FIRST(&tailq_head_file_chunk);
+                //memset(filePacket->ipv4.body, 0x00, sizeof(filePacket->ipv4.body));
                 if (w != 0 && NULL != fileChunk) {
-                    printf("From additional chinking \n");
-                    memcpy(filePacket->ipv4.body, fileChunk->data, fileChunk->length);
+                    //printf("From additional chinking \n");
+                    memcpy(sendPkt->ipv4.body, fileChunk->data, fileChunk->length);
+                    fileChunkCpyCount++;
                     TAILQ_REMOVE(&tailq_head_file_chunk, fileChunk, entries);
+                    free(fileChunk);
                 } else {
-                    memcpy(filePacket->ipv4.body, &mmapedData->data[w], allowedPktReadBytes);
+                    memcpy(sendPkt->ipv4.body, &gmi->curProcessingMmappedData[w], allowedPktReadBytes);
+                    actualMemCpyCount++;
                 }
-
+                //printf("################################################# filePacket->ipv4.body %s \n", filePacket->ipv4.body);
                 
                 head = nm_ring_next(txring, head);
                 txring->cur = head;
@@ -469,7 +487,9 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                             if (n < 1) {
                                 txring->cur = txring->tail;
                             }
+                            //printf("w value is : %lu \n", w);
                             gmi->curFileChunkIndex = w + allowedPktReadBytes;
+                            //float percentage;
                             do {
                                 //printf("Doing again \n");
                                 n = nm_ring_space(txring);
@@ -478,11 +498,14 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                                     //usleep(180);
                                 }
                                 if (n < wakeupLimit) {
-                                    printf("Still less\n");
+                                    //printf("Still less\n");
                                     mmapAndLoadQueue(gmi);
                                     loadFileChunkQueue(bytesToRead, gmi);
+
                                 }
-                                //printf("Now n value : %d \n", n);
+
+                                //percentage = ((bytesToRead - gmi->curFileChunkIndex) / bytesToRead) * 100 ;
+                                //printf("Now percentage value : %f \n", percentage);
                                 //printf("Still n value is : %d \n", nm_ring_space(txring)      
                             } while (n < wakeupLimit);
                         } 
@@ -494,6 +517,8 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                     head = txring->head;
                 }   
             }
+            printf("Actual memcpy count is :  %lu \n", actualMemCpyCount);
+            printf("File chunk memcpy count is :  %lu \n", fileChunkCpyCount);
             if (munmap(mmapedData->data, bytesToRead) == -1) {
                 printf("Failed to un-map the file \n");
                 exit(1);
