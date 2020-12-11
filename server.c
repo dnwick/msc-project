@@ -11,6 +11,9 @@
 #include <netinet/udp.h>
 #include <netinet/ip6.h>
 #include <string.h>
+#include <stdbool.h>
+#include <poll.h>
+#define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
 #include <net/netmap.h>
 #include <libnetmap.h>
@@ -19,14 +22,25 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
+#include <pthread.h>
+#include <semaphore.h>
 
 
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
 #define MAX_BODYSIZE	65536
 
+volatile int curGlobalStatus;
+int numOfPacketsToResend;
+int currentSeqNumber;
+sem_t process_access;
+sem_t global_status_access;
+
+
 
 #define ITERATIONS (10 * 1024 )
+
+const char *netmap_port_value = "netmap:enp1s0";
 
 #define	PKT(p, f, af)	\
     (p)->ipv4.f
@@ -35,11 +49,31 @@ const char *SERVER_IP = "192.168.1.1";
 
 const long long FILE_BUFFER_SIZE = 60 * 1024 * 1024;
 
+int recievedPacketsToReplay;
+
 struct mmaped_data {
     char *data;
 	int length;
     long int start_buf_index;     
     TAILQ_ENTRY(mmaped_data) entries;    
+};
+
+struct seq_file_length_data{
+    int sequence_num;
+	int file_length; 
+    long int cur_byte_read_location; 
+    struct seq_file_length_data *next;    
+    // TAILQ_ENTRY(seq_file_length_data) entries;    
+};
+
+struct resend_pkt_data {
+    int sequence_num;
+    TAILQ_ENTRY(resend_pkt_data) entries; 
+};
+
+struct hash_table {
+    int size;
+    struct seq_file_length_data **seq_file_size_list;
 };
 
 struct file_chunk_data {
@@ -56,6 +90,9 @@ struct dropped_packet_data {
 TAILQ_HEAD(, mmaped_data) tailq_head_mmap;
 TAILQ_HEAD(, file_chunk_data) tailq_head_file_chunk;
 TAILQ_HEAD(, dropped_packet_data) tailq_dropped_packet_data;
+TAILQ_HEAD(, seq_file_length_data) tailq_seq_file_length_data;
+TAILQ_HEAD(, resend_pkt_data) tailq_head_resend_pkt_data;
+
 
 struct virt_header {
 	uint8_t fields[VIRT_HDR_MAX];
@@ -68,7 +105,12 @@ struct pktMeta {
     int size;
 };
 
-enum req_type { FILE_META, FILE_CONTENT };
+struct sequence {
+    int sequence_num;
+};
+
+enum req_type { FILE_META, FILE_CONTENT, FILE_RESEND , FILE_SYNC, FILE_SYNC_ACK, FILE_SYNC_COMPLETE, FILE_MISSED_SEQ_SEND_COMPLETE, FILE_RESEND_COMPLETE, 
+FILE_PROCESS};
 
 
 struct pkt {
@@ -101,6 +143,11 @@ struct ip_range {
 struct mac_range {
 	char *name;
 	struct ether_addr start, end;
+};
+
+struct arguments {
+    struct nmport_d *nmd;
+    struct glob_meta_info *gmi;
 };
 
 static uint16_t
@@ -173,7 +220,7 @@ struct glob_meta_info {
     int virt_header;
     struct nmport_d *nmd;
     char *file_name;
-    int fileDesc;
+    FILE *fileDesc;
     long int fileSize;
     long int readBytes;
     long int curMmappedSize;
@@ -249,6 +296,468 @@ static struct pkt* create_and_get_req_pkt(struct glob_meta_info *gmi){
     return pktdata;
 }
 
+struct hash_table *createHashTable(int size) {
+    struct hash_table *tbl = (struct hash_table*)malloc(sizeof(struct hash_table));
+    tbl->size = size;
+    tbl->seq_file_size_list = (struct seq_file_length_data**)malloc(sizeof(struct seq_file_length_data*)*size);
+    for(int i = 0; i<size;i++) {
+        tbl->seq_file_size_list[i] = NULL;
+    }
+    return tbl;
+}
+
+int getHashCode(struct hash_table *tbl, int key) {
+    if(key < 0) {
+        return -(key % tbl->size);
+    }
+    return key % tbl->size;
+}
+
+struct seq_file_length_data *getObjUsingSeqFromHashMap(struct hash_table *tbl, int sequence_num) {
+    int position = getHashCode(tbl, sequence_num);
+    struct seq_file_length_data *list = tbl->seq_file_size_list[position];
+    struct seq_file_length_data *temp = list;
+    while (temp) {
+        if (temp->sequence_num == sequence_num) {
+            return temp;
+        }
+        temp = temp->next;
+    }
+    return NULL;
+}
+
+void insertValueToHashMap(struct hash_table *tbl, int sequence_num, int file_length, long int bytes_read_location) {
+    int position = getHashCode(tbl, sequence_num);
+    struct seq_file_length_data *list = tbl->seq_file_size_list[position];
+    struct seq_file_length_data *seqFileLengthData;
+    seqFileLengthData = malloc(sizeof(*seqFileLengthData));
+    struct seq_file_length_data *temp = list;
+    while (temp) {
+        if (temp->sequence_num == sequence_num) {
+            temp->file_length = file_length;
+            temp->cur_byte_read_location = bytes_read_location;
+            return;
+        }
+        temp = temp->next;
+    }
+    seqFileLengthData->sequence_num = sequence_num;
+    seqFileLengthData->file_length = file_length;
+    seqFileLengthData->cur_byte_read_location = bytes_read_location;
+    seqFileLengthData->next = list;
+    tbl->seq_file_size_list[position] = seqFileLengthData;
+}
+
+void create_seq_file_length_data(int fileBytes, int pktBytes, int chunkSize, struct hash_table *tbl) {
+
+    int pkt_seq_num = 0;
+    int bytes_read_location = 0;
+    for (int w = 0; w < fileBytes; w += chunkSize) {
+
+        int allowedChunckSize = chunkSize;
+        if (fileBytes - w < chunkSize) {
+            allowedChunckSize = fileBytes - w;
+        }
+
+        for (int j=0; j < allowedChunckSize; j += pktBytes) {
+            int allowedPktReadBytes = pktBytes;
+            if (allowedChunckSize - j < pktBytes) {
+                allowedPktReadBytes = allowedChunckSize - j;
+            }
+            pkt_seq_num++;
+            insertValueToHashMap(tbl, pkt_seq_num, allowedPktReadBytes, bytes_read_location);
+            bytes_read_location += allowedPktReadBytes;
+        }
+    }
+}
+
+void *sendSyncAckPacket(void *vargp) {
+
+    struct arguments *args = vargp;
+    struct nmport_d *nmd = args->nmd;
+    struct glob_meta_info *gmi = args->gmi;
+    curGlobalStatus = FILE_SYNC_ACK;
+
+    while (curGlobalStatus == FILE_SYNC_ACK) {
+        struct netmap_if *nifp = nmd->nifp;
+        struct netmap_ring *txring = NULL;
+        txring = NETMAP_TXRING(nifp, nmd->first_tx_ring);
+        u_int tx_head = txring->head;
+        struct netmap_slot *tx_slot = &txring->slot[tx_head];
+        struct pkt* tx_filePacket = create_and_get_req_pkt(gmi);
+        tx_filePacket->ipv4.pktMeta.req_type = FILE_SYNC_ACK;
+
+        tx_slot = &txring->slot[tx_head];
+        char *tx_p = NETMAP_BUF(txring, tx_slot->buf_idx);
+        
+        tx_slot->flags = 0;
+        struct pkt* tx_sendPkt = (struct pkt*)tx_p;
+
+        tx_sendPkt->eh = tx_filePacket->eh;
+        tx_sendPkt->ipv4.ip = tx_filePacket->ipv4.ip;
+        tx_sendPkt->ipv4.pktMeta = tx_filePacket->ipv4.pktMeta;
+        tx_sendPkt->ipv4.udp = tx_filePacket->ipv4.udp;
+
+        tx_slot->len = gmi->pkt_size;
+        txring->cur = tx_head;
+
+        struct sequence *seq;
+        seq = malloc(sizeof(*seq));
+        seq->sequence_num = currentSeqNumber;
+        memcpy(tx_sendPkt->ipv4.body, (char*)seq, sizeof(int));
+
+        tx_head = nm_ring_next(txring, tx_head);
+        tx_slot->flags |= NS_REPORT;
+        txring->head = txring->cur = tx_head;
+        tx_head = txring->head;
+
+        if (txring != NULL) {
+            ioctl(nmd->fd, NIOCTXSYNC, NULL);
+            //usleep(180);
+        }
+
+        while (nm_tx_pending(txring)) {
+            //printf("################################################# still pending \n");
+            ioctl(nmd->fd, NIOCTXSYNC, NULL);
+            usleep(1); /* wait 1 tick */
+        }
+        free(seq);
+        usleep(3);
+    }
+    printf("FILE_SYNC_ACK Loop exited \n");
+    return 0;
+    
+}
+
+void *sendFileResendCompletePkt(void *vargp) {
+    struct arguments *args = vargp;
+    struct nmport_d *nmd = args->nmd;
+    struct glob_meta_info *gmi = args->gmi;
+    curGlobalStatus = FILE_RESEND_COMPLETE;
+    while (curGlobalStatus == FILE_RESEND_COMPLETE) {
+        struct netmap_if *nifp = nmd->nifp;
+        struct netmap_ring *txring = NULL;
+        txring = NETMAP_TXRING(nifp, nmd->first_tx_ring);
+        u_int tx_head = txring->head;
+        struct netmap_slot *tx_slot = &txring->slot[tx_head];
+        struct pkt* tx_filePacket = create_and_get_req_pkt(gmi);
+        tx_filePacket->ipv4.pktMeta.req_type = FILE_RESEND_COMPLETE;
+
+        tx_slot = &txring->slot[tx_head];
+        char *tx_p = NETMAP_BUF(txring, tx_slot->buf_idx);
+        
+        tx_slot->flags = 0;
+        struct pkt* tx_sendPkt = (struct pkt*)tx_p;
+
+        tx_sendPkt->eh = tx_filePacket->eh;
+        tx_sendPkt->ipv4.ip = tx_filePacket->ipv4.ip;
+        tx_sendPkt->ipv4.pktMeta = tx_filePacket->ipv4.pktMeta;
+        tx_sendPkt->ipv4.udp = tx_filePacket->ipv4.udp;
+
+        tx_slot->len = gmi->pkt_size;
+
+        tx_head = nm_ring_next(txring, tx_head);
+        tx_slot->flags |= NS_REPORT;
+        txring->head = txring->cur = tx_head;
+        tx_head = txring->head;
+
+        if (txring != NULL) {
+            ioctl(nmd->fd, NIOCTXSYNC, NULL);
+            //usleep(180);
+        }
+
+        while (nm_tx_pending(txring)) {
+            //printf("################################################# still pending \n");
+            ioctl(nmd->fd, NIOCTXSYNC, NULL);
+            usleep(1); /* wait 1 tick */
+        }
+        usleep(1);
+    }
+    printf("FILE_RESEND_COMPLETE Loop exited \n");
+    return 0;
+    
+}
+
+void sendMissedPackets(struct nmport_d *nmd, struct glob_meta_info *gmi, struct hash_table *tbl) {
+    
+    struct netmap_if *nifp = nmd->nifp;
+    struct netmap_ring *txring = NULL;
+    txring = NETMAP_TXRING(nifp, nmd->first_tx_ring);
+
+    while (nm_tx_pending(txring)) {
+        //printf("################################################# still pending \n");
+        ioctl(nmd->fd, NIOCTXSYNC, NULL);
+        usleep(1); /* wait 1 tick */
+    }
+
+
+    u_int tx_n, tx_head = txring->head;
+    struct netmap_slot *tx_slot = &txring->slot[tx_head];
+    tx_n = nm_ring_space(txring);
+    struct pkt* tx_filePacket = create_and_get_req_pkt(gmi);
+    tx_filePacket->ipv4.pktMeta.req_type = FILE_RESEND;
+
+    struct resend_pkt_data *resendPktData;
+    printf("Trying to send missed packets -- \n");
+
+    TAILQ_FOREACH(resendPktData, &tailq_head_resend_pkt_data, entries) {
+
+        struct seq_file_length_data* seqFileObj = getObjUsingSeqFromHashMap(tbl, resendPktData->sequence_num);
+        
+        if (NULL == seqFileObj) {
+            printf("HASHMAP does not have the valie -- ");
+        }
+
+        tx_slot = &txring->slot[tx_head];
+        char *tx_p = NETMAP_BUF(txring, tx_slot->buf_idx);
+
+        tx_slot->flags = 0;
+        struct pkt* tx_sendPkt = (struct pkt*)tx_p;
+
+        tx_sendPkt->eh = tx_filePacket->eh;
+        tx_sendPkt->ipv4.ip = tx_filePacket->ipv4.ip;
+        tx_sendPkt->ipv4.pktMeta = tx_filePacket->ipv4.pktMeta;
+        tx_sendPkt->ipv4.udp = tx_filePacket->ipv4.udp;
+        tx_sendPkt->ipv4.pktMeta.sequence_num = resendPktData->sequence_num;
+        //printf("status number : %d -- ", tx_sendPkt->ipv4.pktMeta.req_type);
+
+        tx_slot->len = gmi->pkt_size;
+
+        int fseeked = fseek(gmi->fileDesc, seqFileObj->cur_byte_read_location, SEEK_SET);
+        if (fseeked != 0) {
+            printf("fseek failed \n");
+        }
+       // printf("fseek success \n");
+        size_t readCount = fread(tx_sendPkt->ipv4.body, seqFileObj->file_length, 1, gmi->fileDesc);
+       // printf("freed success \n");
+        (void)readCount;
+
+        tx_head = nm_ring_next(txring, tx_head);
+        tx_slot->flags |= NS_REPORT;
+        txring->head = txring->cur = tx_head;
+        tx_head = txring->head;
+
+        tx_n--;
+
+        TAILQ_REMOVE(&tailq_head_resend_pkt_data, resendPktData, entries);
+        
+
+        if (tx_n == 0) {
+            tx_slot->flags |= NS_REPORT;
+            txring->head = tx_head;
+            txring->cur = tx_head;
+            do {
+                tx_n = nm_ring_space(txring);
+                if (txring != NULL) {
+                    ioctl(nmd->fd, NIOCTXSYNC, NULL);
+                    //usleep(180);
+                }     
+            } while (tx_n == 0);
+            
+            txring = NETMAP_TXRING(nifp, nmd->first_tx_ring);
+            tx_head = txring->head;
+        }
+    }
+
+    while (nm_tx_pending(txring)) {
+        //printf("################################################# still pending \n");
+        ioctl(nmd->fd, NIOCTXSYNC, NULL);
+        usleep(1); /* wait 1 tick */
+    }
+
+    if (TAILQ_EMPTY(&tailq_head_resend_pkt_data)) {
+        printf("Sending send complete message \n");
+        pthread_t flowcontrolMissedResendCompId;
+        struct arguments args;
+        args.nmd = nmd;
+        args.gmi = gmi;
+        int val = pthread_create(&flowcontrolMissedResendCompId, NULL, sendFileResendCompletePkt, (void *)&args);
+        if (val == -1) {
+            printf("Unable to create the thread");
+        }
+        (void)val;
+        //sendFileResendCompletePkt(nmd, gmi);
+    } else {
+        printf("tailq is not empty-- \n");
+    }
+
+    
+}
+
+
+void *handle_packet_sync(void *vargp) {
+
+
+    struct arguments *args = vargp;
+    struct nmport_d *nmd = args->nmd;
+    struct glob_meta_info *gmi = args->gmi;
+    printf("gmi->file_name : %s \n", gmi->file_name);
+    TAILQ_INIT(&tailq_head_resend_pkt_data);
+
+    struct stat sb;
+    if(fstat(fileno(gmi->fileDesc), &sb) == -1) {
+        printf("Failed to get file size \n");
+        exit(1);
+    }
+
+
+    int i;
+    struct netmap_ring *rxring;
+    
+    //TAILQ_INIT(&tailq_seq_file_length_data);
+    long int fileSize = sb.st_size;
+    int pkt_payload_size = 1400;
+    long int chunkSize = 60 * 1024 * 1024;
+    uint64_t hashTblSize = fileSize / pkt_payload_size;
+
+    if (fileSize % pkt_payload_size != 0) {
+        hashTblSize++;
+    }
+
+    struct hash_table *tbl = createHashTable(hashTblSize);
+
+    create_seq_file_length_data(fileSize, pkt_payload_size, chunkSize, tbl);
+
+    struct pollfd pfd = { .fd = nmd->fd, .events = POLLIN };
+    static bool stopReceiving = false;
+
+    struct netmap_if *nifp = nmd->nifp;
+    
+
+    while (!stopReceiving) {
+
+        i = poll(&pfd, 1, 1 * 1000);
+        
+        if (i < 0) {
+            //printf("numOfPacketsToResend : %d \n", numOfPacketsToResend);
+			D("poll error \n");
+		} else if (i == 0) {
+            RD(1, "waiting for initial packets, poll returns %d %d",
+			i, pfd.revents);
+        }
+
+		if (pfd.revents & POLLERR) {
+			D("poll err here");
+			
+		}
+
+        uint64_t cur_space = 0;
+        for (i = nmd->first_rx_ring; i <= nmd->last_rx_ring; i++) {
+            int m;
+			rxring = NETMAP_RXRING(nifp, i);
+            if (nm_ring_empty(rxring)){
+                printf("Recieve packets empty \n");
+                continue;
+            }
+
+			m = rxring->head + rxring->num_slots - rxring->tail;
+			if (m >= (int) rxring->num_slots){
+                m -= rxring->num_slots;
+            }
+				
+			cur_space += m;
+            u_int head, rx, n;
+            u_int limit = 512;
+
+            head = rxring->head;
+            n = nm_ring_space(rxring);
+			
+            if (n < limit){
+                limit = n;
+            }
+
+            for (rx = 0; rx < limit; rx++) {
+                struct netmap_slot *slot = &rxring->slot[head];
+				char *p = NETMAP_BUF(rxring, slot->buf_idx);
+
+				struct ether_header *ethh;
+                struct ip *iph;
+                struct udphdr *udph;
+                struct pktMeta *pktMeta;
+
+				ethh = (struct ether_header *)p;
+                if (ethh->ether_type != htons(ETHERTYPE_IP)) {
+                    /* Filter out non-IP traffic. */
+                    //return 0;
+                }
+                iph = (struct ip *)(ethh + 1);
+                
+                if (iph->ip_p != IPPROTO_UDP) {
+                    /* Filter out non-UDP traffic. */
+                    //return 0;
+                }
+                pktMeta = (struct pktMeta *)(iph + 1);
+                udph = (struct udphdr *)(pktMeta + 1);
+                //printf("udph->uh_dport : %d \n", udph->uh_dport);
+
+                if (udph->uh_dport == htons(8000)) {
+                    char *restOfPayload = (char*)(udph + 1);
+                    
+                    //(void)restOfPayload;
+                    if (pktMeta->req_type == FILE_SYNC) {
+                        sem_wait(&global_status_access);
+                        if (curGlobalStatus == -1) {
+                            curGlobalStatus = FILE_SYNC;
+                            sem_post(&global_status_access);
+                            printf("received a sync packet \n");
+                            sem_wait(&process_access);
+
+                            pthread_t flowcontrolThreadId;
+                            struct arguments args;
+                            args.nmd = nmd;
+                            args.gmi = gmi;
+                            int val = pthread_create(&flowcontrolThreadId, NULL, sendSyncAckPacket, (void *)&args);
+                            if (val == -1) {
+                                printf("Unable to create the thread");
+                            }
+                            (void)val;
+                            //pthread_join(flowcontrolThreadId, NULL);
+                            //sendSyncAckPacket(nmd, gmi);
+                            printf("sent sync ack message \n"); 
+                        }
+                        sem_post(&global_status_access);
+                    } else if (pktMeta->req_type == FILE_META) {
+                        
+                        struct sequence *seq;
+                        seq = (struct sequence*)restOfPayload;
+                        numOfPacketsToResend++;
+
+                        struct resend_pkt_data *resendPktData;
+                        resendPktData = malloc(sizeof(*resendPktData));
+
+                        if (resendPktData == NULL) {
+                            perror("malloc failed");
+                            exit(EXIT_FAILURE);
+                        }
+                        resendPktData->sequence_num = seq->sequence_num;
+                        TAILQ_INSERT_TAIL(&tailq_head_resend_pkt_data, resendPktData, entries);
+                    } else if (pktMeta->req_type == FILE_SYNC_COMPLETE){
+                        sem_wait(&global_status_access);
+                        if (curGlobalStatus == FILE_RESEND_COMPLETE || curGlobalStatus == FILE_SYNC_ACK) {
+                            curGlobalStatus = FILE_SYNC_COMPLETE;
+                            sem_post(&global_status_access);
+                            printf("received a sync complete message \n");
+                            sem_post(&process_access);
+                        }
+                        sem_post(&global_status_access);
+                    } else if (pktMeta->req_type == FILE_MISSED_SEQ_SEND_COMPLETE){
+                        sem_wait(&global_status_access);
+                        if (curGlobalStatus == FILE_SYNC_ACK) {
+                            curGlobalStatus = FILE_MISSED_SEQ_SEND_COMPLETE;
+                            sem_post(&global_status_access);
+                            printf("received a missed seq complete message \n");
+                            sendMissedPackets(nmd, gmi, tbl);
+                        }  
+                        sem_post(&global_status_access);
+                    }
+                }
+                head = nm_ring_next(rxring, head);
+            }
+            rxring->head = rxring->cur = head;
+        }
+    }
+    return 0;
+}
+
 static void loadFileChunkQueue(long int bytesToRead, struct glob_meta_info *gmi) {
     long int allowedFileChunkReadBytes;
 
@@ -276,7 +785,7 @@ static void loadFileChunkQueue(long int bytesToRead, struct glob_meta_info *gmi)
 
 static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
 
-    int fileDesc = gmi->fileDesc;
+    int fileDesc = fileno(gmi->fileDesc);
     long int bytesToRead;
     long int mmapLimit = 120 * 1024 * 1024;
    // printf("gmi->fileSize : %lu\n", gmi->fileSize);
@@ -314,27 +823,11 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     }   
 }
 
- static void read_and_send()
+ static void read_and_send(struct nmport_d *nmd, struct glob_meta_info *gmi)
 {
-
-    //char filePath[] = "/home/damith/workspace/files/client.c";
-    //char filePath[] = "/home/damith/workspace/files/file1.txt";
-    //char filePath[] = "/home/damith/workspace/files/file2.txt";
-    //char filePath[] = "/home/damith/workspace/files/cpyFile9-400mb";
-    //char filePath[] = "/home/damith/finalProj/fileRepo/cpyFile11-200mb-out";
-    //char filePath[] = "/home/damith/finalProj/fileRepo/netmapClientPsudoCode";
-    char filePath[] = "/home/damith/finalProj/fileRepo/file1.txt-out";
-    
-
-    struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
     struct pkt* filePacket = create_and_get_req_pkt(gmi);
-    gmi->file_name = filePath;
 
-    int fileDesc = gmi->fileDesc = open(gmi->file_name, O_RDONLY);
-    if (!fileDesc) {
-        printf("Failed to read \n");
-        exit(1);
-    }
+    int fileDesc = fileno(gmi->fileDesc);
 
     struct stat sb;
     if(fstat(fileDesc, &sb) == -1) {
@@ -347,40 +840,23 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
     struct netmap_if *nifp;
 	struct netmap_ring *txring = NULL;
 
-    gmi->nmd = nmport_prepare("netmap:enp1s0");
-
-    if (gmi->nmd == NULL){
-		printf("something is wrong ...");
-    	printf("\n");
-	}
-
-	if (nmport_open_desc(gmi->nmd) < 0){
-		printf("something is wrong ...");
-    	printf("\n");
-	} else{
-		printf("Netmap opened ...");
-    	printf("\n");
-	}
-
-	D("Wait %d secs for phy reset", 2);
-	sleep(2);
-	D("Ready to send data through netmap");
+    gmi->nmd = nmd;
     
     double start_time = now();
     double elapsed_time;
     TAILQ_INIT(&tailq_head_mmap);
     TAILQ_INIT(&tailq_head_file_chunk);
+    
     int sequenceNum = 1;
     nifp = gmi->nmd->nifp;
     long int processedFileSize = 0;
     u_int wakeupLimit = 170;
+
+    uint64_t allPacketCount = 0;
     
     while(mmapAndLoadQueue(gmi)) {
         struct mmaped_data *mmapedData;
         long int bytesToRead = 0;
-
-       // struct mmaped_data *firstVal = TAILQ_FIRST(&tailq_head_mmap);
-       // (void)firstVal;
 
         TAILQ_FOREACH(mmapedData, &tailq_head_mmap, entries) {
 
@@ -395,6 +871,8 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
             }
 	        uint64_t sent = 0;
             printf("numOfPacketsToSend %ld\n", numOfPacketsToSend);
+            allPacketCount += numOfPacketsToSend;
+            
         
             txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
             u_int n, head = txring->head;
@@ -404,26 +882,32 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
             long int actualMemCpyCount = 0;
             long int fileChunkCpyCount = 0;
 
-            for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo 
-
+            for (off_t w = 0; w < bytesToRead && sent < numOfPacketsToSend; w += pkt_payload_size) { //todo
+                sem_wait(&process_access);
+                if (curGlobalStatus == FILE_SYNC_COMPLETE) {
+                    printf("Process resumed after sync !!!!! \n");
+                    n = nm_ring_space(txring);
+                }
+                
                 u_int tosend = gmi->pkt_size;
                 allowedPktReadBytes = pkt_payload_size;
                 if (bytesToRead - w < pkt_payload_size) {
                     allowedPktReadBytes = bytesToRead - w;
                 
                 }
-                
-                //printf("allowedPktReadBytes %lu \n", allowedPktReadBytes);
+
                 slot = &txring->slot[head];
                 char *p = NETMAP_BUF(txring, slot->buf_idx);
                 slot->flags = 0;
                 struct pkt* sendPkt = (struct pkt*)p;
-                //sendPkt->vh = filePacket->vh;
                 sendPkt->eh = filePacket->eh;
                 sendPkt->ipv4.ip = filePacket->ipv4.ip;
                 sendPkt->ipv4.pktMeta = filePacket->ipv4.pktMeta;
                 sendPkt->ipv4.udp = filePacket->ipv4.udp;
                 sendPkt->ipv4.pktMeta.sequence_num = sequenceNum;
+
+                
+                currentSeqNumber = sequenceNum;
 
                 if (sequenceNum == 1 && w == 0) {
                     sendPkt->ipv4.pktMeta.status = 1;
@@ -436,6 +920,7 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                     printf("Enddddddddddd \n");
                     sendPkt->ipv4.pktMeta.status = 3;
                 }
+                curGlobalStatus = -1; 
                 
                 slot->len = tosend;
                 
@@ -516,9 +1001,11 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
                     txring = NETMAP_TXRING(nifp, gmi->nmd->first_tx_ring);
                     head = txring->head;
                 }   
+                sem_post(&process_access);
             }
-            printf("Actual memcpy count is :  %lu \n", actualMemCpyCount);
-            printf("File chunk memcpy count is :  %lu \n", fileChunkCpyCount);
+            //sync_commit(mmapedData, sequenceNum);
+            //printf("Actual memcpy count is :  %lu \n", actualMemCpyCount);
+            //printf("File chunk memcpy count is :  %lu \n", fileChunkCpyCount);
             if (munmap(mmapedData->data, bytesToRead) == -1) {
                 printf("Failed to un-map the file \n");
                 exit(1);
@@ -533,11 +1020,14 @@ static int mmapAndLoadQueue(struct glob_meta_info *gmi) {
         ioctl(gmi->nmd->fd, NIOCTXSYNC, NULL);
         usleep(1); /* wait 1 tick */
     }
+   // close(fileDesc);
+    
 
     double end_time = now();
     elapsed_time = end_time - start_time;
     printf("It took %f seconds to read 25GB \n", elapsed_time);
     printf("last seq num is %d \n", sequenceNum);
+    printf("Num of all packets sent %lu \n", allPacketCount);
 }
 
 
@@ -548,8 +1038,70 @@ int main()
     printf("Using server ip as %s", SERVER_IP);
     printf("\n");
 
-    read_and_send();
-    printf("Afterrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr");
-    printf("\n");
+    struct nmport_d *nmd = nmport_prepare(netmap_port_value);
+    sem_init(&process_access, 0 , 1);
+    sem_init(&global_status_access, 0 , 1);
+
+    if (nmd == NULL){
+		printf("something is wrong ...");
+    	printf("\n");
+	}
+
+	if (nmport_open_desc(nmd) < 0){
+		printf("something is wrong ...");
+    	printf("\n");
+	} else{
+		printf("Netmap opened ...");
+    	printf("\n");
+	}
+
+	D("Wait %d secs for phy reset", 2);
+	sleep(2);
+	D("Ready to send data through netmap");
+
+
+    //char filePath[] = "/home/damith/workspace/files/client.c";
+    //char filePath[] = "/home/damith/workspace/files/file1.txt";
+    //char filePath[] = "/home/damith/workspace/files/file2.txt";
+    //char filePath[] = "/home/damith/workspace/files/cpyFile9-400mb";
+   // char filePath[] = "/home/damith/finalProj/fileRepo/cpyFile11-200mb-out";
+    //char filePath[] = "/home/damith/finalProj/fileRepo/netmapClientPsudoCode";
+   // char filePath[] = "/home/damith/finalProj/fileRepo/netmapClientPsudoCode-4kb";
+   //char filePath[] = "/home/damith/finalProj/fileRepo/output9.txt";
+   //char filePath[] = "/home/damith/finalProj/fileRepo/cpyFile14-400mb";
+   
+   
+    
+    //char filePath[] = "/home/damith/finalProj/fileRepo/file1.txt-out";
+    char filePath[] = "/home/damith/finalProj/fileRepo/cpyFile13-1gb.txt";
+    //char filePath[] = "/home/damith/finalProj/fileRepo/file1.txt-out";
+
+    struct glob_meta_info *gmi = calloc(1, sizeof(*gmi));
+    FILE *file_write_desc = fopen(filePath, "r+");
+
+    if (file_write_desc == NULL) {
+        printf("Failed to open file \n");
+        perror("fopen()");
+        exit(1);
+    }
+
+    struct stat buf;
+    fstat(fileno(file_write_desc), &buf);
+    gmi->fileSize = buf.st_size;
+    gmi->fileDesc = file_write_desc;
+
+    pthread_t thread_id;
+    numOfPacketsToResend = 0;
+    struct arguments args;
+    args.nmd = nmd;
+    args.gmi = gmi;
+
+    int val = pthread_create(&thread_id, NULL, handle_packet_sync, (void *)&args);
+    if (val == -1) {
+       printf("Unable to create the thread");
+    }
+    (void)val;
+    read_and_send(nmd, gmi);
+    pthread_join(thread_id, NULL);
 }
 /* end of file */
